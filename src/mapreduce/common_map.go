@@ -1,12 +1,20 @@
 package mapreduce
 
 import (
+	"encoding/json"
+	"fmt"
 	"hash/fnv"
+	"io"
+	"io/ioutil"
+	"os"
 )
+
+var fileMap map[string]*os.File = make(map[string]*os.File)
 
 // doMap manages one map task: it reads one of the input files
 // (inFile), calls the user-defined map function (mapF) for that file's
 // contents, and partitions the output into nReduce intermediate files.
+// 读取某个输入文件，对于文件的内容调用用户定义的map函数，并且将输出分成nReduce个中间文件
 func doMap(
 	jobName string, // the name of the MapReduce job
 	mapTaskNumber int, // which map task this is
@@ -14,6 +22,58 @@ func doMap(
 	nReduce int, // the number of reduce task that will be run ("R" in the paper)
 	mapF func(file string, contents string) []KeyValue,
 ) {
+	// 首先读取文件
+	in, err := os.Open(inFile)
+	if err != nil {
+		panic(err)
+	}
+	defer in.Close()
+	content, err := ioutil.ReadAll(in)
+
+	// 然后调用mapF函数
+	keyValues := mapF(inFile, string(content))
+
+	// 然后将kv对放到不同的文件中
+	for _, keyValue := range keyValues {
+
+		// 获取文件file指针
+		reduceTaskNumber := ihash(keyValue.Key) % nReduce
+		reduceFileName := reduceName(jobName, mapTaskNumber, reduceTaskNumber)
+		reduceFile, ok := fileMap[reduceFileName]
+		if !ok {
+			reduceFile = openFileAndWriteJsonPrefix(reduceFileName)
+			fileMap[reduceFileName] = reduceFile
+		}
+
+		// 将keyValue解析为json
+		jsonStr, err := json.Marshal(keyValue)
+		if err != nil {
+			fmt.Println("生成json字符串错误")
+		}
+
+		// 写入到文件中
+		_, err1 := io.WriteString(reduceFile, string(jsonStr))
+		if err1 != nil {
+			panic(err1)
+		}
+
+	}
+
+	for _, file := range fileMap {
+
+		// 写入JSON数组后缀
+		_, err1 := io.WriteString(file, "]") //写入JSON数组的后缀
+		if err1 != nil {
+			panic(err1)
+		}
+
+		// 关闭文件
+		err := file.Close()
+		if err != nil {
+			panic(err1)
+		}
+	}
+
 	//
 	// You will need to write this function.
 	//
@@ -53,6 +113,40 @@ func doMap(
 	//
 	// Remember to close the file after you have written all the values!
 	//
+}
+
+func openFileAndWriteJsonPrefix(filename string) *os.File {
+	var file *os.File
+	var err error
+	if fileIfExist(filename) {
+		file, err = os.Open(filename)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		file, err = os.Create(filename)
+		if err != nil {
+			panic(err)
+		}
+	}
+	_, err1 := io.WriteString(file, "[") //写入JSON数组的前缀
+	if err1 != nil {
+		panic(err1)
+	}
+	return file
+}
+
+//存在返回 true，不存在返回 false
+func fileIfExist(filename string) bool {
+	_, err := os.Stat(filename)
+	if nil != err {
+		fmt.Println(filename, "is not exist!")
+		return false
+	}
+	if os.IsNotExist(err) {
+		return false
+	}
+	return true
 }
 
 func ihash(s string) int {
