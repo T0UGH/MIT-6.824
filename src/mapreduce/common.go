@@ -2,6 +2,8 @@ package mapreduce
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"strconv"
 )
 
@@ -40,4 +42,26 @@ func reduceName(jobName string, mapTask int, reduceTask int) string {
 // mergeName constructs the name of the output file of reduce task <reduceTask>
 func mergeName(jobName string, reduceTask int) string {
 	return "mrtmp." + jobName + "-res-" + strconv.Itoa(reduceTask)
+}
+
+func openFileAndWriteJsonPrefix(filename string) *os.File {
+	var file *os.File
+	var err error
+	if fileIfExist(filename) {
+		err = os.Remove(filename)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	file, err = os.Create(filename)
+	if err != nil {
+		panic(err)
+	}
+
+	_, err1 := io.WriteString(file, "[") //写入JSON数组的前缀
+	if err1 != nil {
+		panic(err1)
+	}
+	return file
 }

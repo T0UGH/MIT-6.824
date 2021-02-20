@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"mapreduce"
 	"os"
+	"strings"
+	"unicode"
 )
 
 //
@@ -14,7 +16,23 @@ import (
 // of key/value pairs.
 //
 func mapF(filename string, contents string) []mapreduce.KeyValue {
-	// TODO: you have to write this function
+	wordList := strings.FieldsFunc(contents, unicode.IsSpace)
+	var keyValues []mapreduce.KeyValue
+	for _, word := range wordList {
+		if isWord(word) {
+			keyValues = append(keyValues, mapreduce.KeyValue{Key: word, Value: "1"})
+		}
+	}
+	return keyValues
+}
+
+func isWord(word string) bool {
+	for _, l := range word {
+		if !unicode.IsLetter(l) {
+			return false
+		}
+	}
+	return true
 }
 
 //
@@ -23,7 +41,7 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 // any map task.
 //
 func reduceF(key string, values []string) string {
-	// TODO: you also have to write this function
+	return fmt.Sprintf("%d", len(values))
 }
 
 // Can be run in 3 ways:

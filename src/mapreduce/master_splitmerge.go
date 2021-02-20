@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 	"sort"
@@ -21,13 +22,10 @@ func (mr *Master) merge() {
 		if err != nil {
 			log.Fatal("Merge: ", err)
 		}
-		dec := json.NewDecoder(file)
-		for {
-			var kv KeyValue
-			err = dec.Decode(&kv)
-			if err != nil {
-				break
-			}
+		content, err := ioutil.ReadAll(file)
+		var currKeyValues []KeyValue
+		err = json.Unmarshal(content, &currKeyValues)
+		for _, kv := range currKeyValues {
 			kvs[kv.Key] = kv.Value
 		}
 		file.Close()

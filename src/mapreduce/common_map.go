@@ -9,8 +9,6 @@ import (
 	"os"
 )
 
-var fileMap map[string]*os.File = make(map[string]*os.File)
-
 // doMap manages one map task: it reads one of the input files
 // (inFile), calls the user-defined map function (mapF) for that file's
 // contents, and partitions the output into nReduce intermediate files.
@@ -22,6 +20,7 @@ func doMap(
 	nReduce int, // the number of reduce task that will be run ("R" in the paper)
 	mapF func(file string, contents string) []KeyValue,
 ) {
+	var fileMap map[string]*os.File = make(map[string]*os.File)
 	// 首先读取文件
 	in, err := os.Open(inFile)
 	if err != nil {
@@ -49,29 +48,31 @@ func doMap(
 		jsonStr, err := json.Marshal(keyValue)
 		if err != nil {
 			fmt.Println("生成json字符串错误")
+			panic(err)
 		}
 
 		// 写入到文件中
-		_, err1 := io.WriteString(reduceFile, string(jsonStr))
+		_, err1 := io.WriteString(reduceFile, string(jsonStr)+",")
 		if err1 != nil {
 			panic(err1)
 		}
 
 	}
-
+	// 关闭文件map中所有打开的文件
 	for _, file := range fileMap {
 
 		// 写入JSON数组后缀
-		_, err1 := io.WriteString(file, "]") //写入JSON数组的后缀
-		if err1 != nil {
-			panic(err1)
+		_, err = file.Seek(-1, 1)
+		if err != nil {
+			panic(err)
+		}
+		_, err = file.WriteString("]")
+		if err != nil {
+			panic(err)
 		}
 
 		// 关闭文件
-		err := file.Close()
-		if err != nil {
-			panic(err1)
-		}
+		defer file.Close()
 	}
 
 	//
@@ -115,32 +116,10 @@ func doMap(
 	//
 }
 
-func openFileAndWriteJsonPrefix(filename string) *os.File {
-	var file *os.File
-	var err error
-	if fileIfExist(filename) {
-		file, err = os.Open(filename)
-		if err != nil {
-			panic(err)
-		}
-	} else {
-		file, err = os.Create(filename)
-		if err != nil {
-			panic(err)
-		}
-	}
-	_, err1 := io.WriteString(file, "[") //写入JSON数组的前缀
-	if err1 != nil {
-		panic(err1)
-	}
-	return file
-}
-
 //存在返回 true，不存在返回 false
 func fileIfExist(filename string) bool {
 	_, err := os.Stat(filename)
 	if nil != err {
-		fmt.Println(filename, "is not exist!")
 		return false
 	}
 	if os.IsNotExist(err) {
