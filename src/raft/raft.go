@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,8 @@ import "labrpc"
 
 // import "bytes"
 // import "encoding/gob"
+
+const HeartBeatTime = 100 * time.Millisecond
 
 // 当每个Raft peer意识到连续的日志条目是已提交的后，peer应发送一个ApplyMsg到位于同一个服务器上的服务,via the applyCh passed to Make()。
 // as each Raft peer becomes aware that successive log entries are
@@ -52,7 +55,6 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	// todo: 在这里加raft server需要保存的状态
 
 	// 持久化状态
 	currentTerm int
@@ -81,7 +83,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
-	// Your code here (2A). //todo: 如何判断自己是不是领导
+	// Your code here (2A).
 	term = rf.currentTerm
 	isleader = rf.isLeader
 	return term, isleader
@@ -128,7 +130,7 @@ type RequestVoteArgs struct {
 	CandidateId  int
 	LastLogIndex int
 	LastLogTerm  int
-	// Your data here (2A, 2B). // todo: 实现
+	// Your data here (2A, 2B).
 }
 
 //
@@ -138,7 +140,18 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
-	// Your data here (2A). // todo: 实现
+	// Your data here (2A).
+}
+
+type AppendEntriesArgs struct {
+	Term int
+	// todo: 实现2B2C
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	success bool
+	// todo: 实现2B2C
 }
 
 //
@@ -169,6 +182,32 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = true
 	return
 
+}
+
+//
+// Append Entries Handler
+// Append Entries RPC的处理函数
+//
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// Your code here (2A, 2B).
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.success = false
+		return
+	}
+	if rf.isLeader {
+		rf.isLeader = false
+	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+	}
+	// 收到合格的heartbeat就重置时钟
+	rf.timeout.Stop()
+	rf.timeout.Reset(randVoteTime(HeartBeatTime))
+
+	reply.Term = rf.currentTerm
+	reply.success = true
+	return
 }
 
 // 发送请求投票RPC给其他server
@@ -210,6 +249,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -275,35 +319,104 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	rf.timeout = time.NewTimer(1 * time.Second) // todo: 需要一个随机时间生成器
-	go func() {
-		<-rf.timeout.C
+	rf.timeout = time.NewTimer(randVoteTime(HeartBeatTime))
+
+	// 启动投票后台进程
+	go voteBackground(rf)
+
+	// 启动heartbeat投票进程
+	go heartbeatBackground(rf)
+
+	return rf
+}
+
+const RandArgUpper int = 50
+const RandArgLower int = 3
+
+/**
+* 根据传入的heartbeat来生成一个选举时间
+ */
+func randVoteTime(heartbeatTime time.Duration) time.Duration {
+	rand.Seed(time.Now().UnixNano())
+	randArg := RandArgLower + rand.Intn(RandArgUpper-RandArgLower)
+	return time.Duration(randArg) * heartbeatTime
+}
+
+/**
+* 监听timeout时钟信道，当时钟信道触发时就开始一次选举
+ */
+func voteBackground(rf *Raft) {
+	for range rf.timeout.C {
+		// 如果本来就是leader的话，就不用vote了
+		if rf.isLeader {
+			continue
+		}
 		rf.currentTerm += 1
 		rf.voteFor = rf.me
 		// 发起投票
-		var success int32 = 0
+		DPrintf("raft/raft/voteBackground: server [%d] start vote term[%d]", rf.me, rf.currentTerm)
+		var voteNum int32 = 1
 		waitGroup := sync.WaitGroup{}
-		waitGroup.Add(len(peers))
-		for i := range peers {
-			args := RequestVoteArgs{
-				Term:        rf.currentTerm,
-				CandidateId: rf.me,
-				//todo: 这里在2B需要加参数
+		waitGroup.Add(len(rf.peers) - 1)
+		for i := range rf.peers {
+			if i == rf.me {
+				continue
 			}
-			reply := RequestVoteReply{}
-			ok := rf.sendRequestVote(i, &args, &reply)
-			if ok && reply.VoteGranted {
-				atomic.AddInt32(&success, 1)
-			}
-			waitGroup.Done()
+			go func(i int) {
+				args := RequestVoteArgs{
+					Term:        rf.currentTerm,
+					CandidateId: rf.me,
+					//todo: 这里在2B需要加参数
+				}
+				reply := RequestVoteReply{}
+				ok := rf.sendRequestVote(i, &args, &reply)
+				if ok && reply.VoteGranted {
+					atomic.AddInt32(&voteNum, 1)
+					DPrintf("raft/raft/voteBackground: server[%d] got vote from [%d] term[%d]", rf.me, i, rf.currentTerm)
+				}
+				waitGroup.Done()
+			}(i)
 		}
 		waitGroup.Wait()
-		// todo: 处理选举成功和选举失败两种情况
-		// 选举成功肯定是就接着来
-		// 选举失败怎么处理
-		// 搞个waitGroup来给其他人发requestVoteRPC
-		//rf.sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool
-	}()
-	// 在这逻辑
-	return rf
+		if voteNum > int32(len(rf.peers)/2) {
+			// 选举成功，那就可以开始发heartbeat了
+			DPrintf("raft/raft/voteBackground: server[%d] vote success term[%d] with vote[%d/%d]", rf.me, rf.currentTerm, voteNum, len(rf.peers))
+			rf.isLeader = true
+		} else {
+			// 选举失败，就设置一个随机的时钟，过一会儿再重新选举
+			DPrintf("raft/raft/voteBackground: server[%d] vote fail term[%d] with vote[%d/%d]", rf.me, rf.currentTerm, voteNum, len(rf.peers))
+			rf.timeout.Reset(randVoteTime(HeartBeatTime))
+
+		}
+	}
+}
+
+/**
+* 开启一个后台进程，如果rf.isLeader就定期发heartbeat，不然就不发
+ */
+func heartbeatBackground(rf *Raft) {
+	for {
+		if rf.isLeader {
+
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+				go func(i int) {
+					args := AppendEntriesArgs{
+						Term: rf.currentTerm,
+						//todo: 这里在2B需要加参数
+					}
+					reply := AppendEntriesReply{}
+					DPrintf("raft/raft/heartbeatBackground: server[%d] heartbeat term[%d] to[%d]", rf.me, rf.currentTerm, i)
+					ok := rf.sendAppendEntries(i, &args, &reply)
+					if ok && reply.Term > rf.currentTerm && rf.isLeader == true {
+						// 先只把heartbeat停掉就行
+						rf.isLeader = false
+					}
+				}(i)
+			}
+		}
+		time.Sleep(HeartBeatTime)
+	}
 }
