@@ -51,6 +51,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state 持久化状态
 	me        int                 // this peer's index into peers[] 我是谁
 	timeout   *time.Timer         //超时时钟
+	applyCh   chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -189,12 +190,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// todo 检查一下这个判断语句对不对
 	// 如果参数中的任期大于当前任期，但候选者的日志比较旧，也不能投票给它
-	if args.LastLogTerm < rf.log[len(rf.log)-1].Term || args.LastLogIndex < len(rf.log)-1 {
+	if args.LastLogIndex < len(rf.log)-1 || len(rf.log) != 0 && args.LastLogTerm < rf.log[len(rf.log)-1].Term {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
 
+	// todo: 如果我是上一轮的候选者，这个时候我可能还没有选举完
 	// 如果任期大于当前任期，且候选者的日志还比较新，就给它投
 	rf.currentTerm = args.Term
 	rf.voteFor = args.CandidateId
@@ -219,7 +221,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// 2 prevLog没有怎么处理
-	noPrevLog := args.PrevLogIndex > len(rf.log) || args.PrevLogTerm != -1 && args.PrevLogTerm != rf.log[args.PrevLogIndex].Term
+	noPrevLog := args.PrevLogIndex >= len(rf.log) || args.PrevLogTerm != -1 && args.PrevLogTerm != rf.log[args.PrevLogIndex].Term
 	if noPrevLog {
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -227,7 +229,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// 3and4 截取并且拼接
-	rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
+	DPrintf("raft/raft/AppendEntries: server [%d] update log[] from [%v]", rf.me, rf.log)
+	if args.PrevLogIndex <= -1 {
+		rf.log = append(rf.log[:0], args.Entries...)
+	} else {
+		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	}
+	DPrintf("raft/raft/AppendEntries: server [%d] update log[] to [%v]", rf.me, rf.log)
 
 	// 如果我是领导，并且还收到了一个至少termNumber跟我一样新的AppendEntries，就说明我是老领导，则设置我不是领导了
 	if rf.isLeader {
@@ -238,13 +246,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 	}
 
+	rf.mu.Lock()
 	if args.LeaderCommit > rf.commitIndex {
-		if args.LeaderCommit > len(rf.log) {
-			rf.commitIndex = len(rf.log)
+		DPrintf("raft/raft/AppendEntries: if args.LeaderCommit[%d] > rf.commitIndex[%d] | len(rf.log)[%d]", args.LeaderCommit, rf.commitIndex, len(rf.log))
+		oldCommitIndex := rf.commitIndex
+		if args.LeaderCommit > len(rf.log)-1 {
+			rf.commitIndex = len(rf.log) - 1
 		} else {
 			rf.commitIndex = args.LeaderCommit
 		}
+		// 通过信道发送已提交的命令
+		for i := oldCommitIndex + 1; i < rf.commitIndex+1; i++ {
+			applyMsg := ApplyMsg{
+				Index:   i + 1,
+				Command: rf.log[i].Command,
+			}
+			rf.applyCh <- applyMsg
+			DPrintf("raft/raft/AppendEntries: server[%d] send to applyCh [%v]", rf.me, applyMsg)
+		}
 	}
+	rf.mu.Unlock()
 
 	// 重置时钟
 	rf.timeout.Stop()
@@ -294,11 +315,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	DPrintf("raft/raft/sendRequestVote: from[%d] to[%d] args[%+v] reply[%+v] ok[%v]", rf.me, server, args, reply, ok)
 	return ok
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	DPrintf("raft/raft/sendAppendEntries: from[%d] to[%d] args[%+v] reply[%+v] ok[%v]", rf.me, server, args, reply, ok)
+
 	return ok
 }
 
@@ -332,7 +356,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 	// Your code here (2B).
 	rf.mu.Unlock()
-	return index, term, isLeader
+	return index + 1, term, isLeader
 }
 
 // 杀死时会调用，先不用管
@@ -366,6 +390,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.initState()
@@ -383,7 +408,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-const RandArgUpper int = 50
+const RandArgUpper int = 10
 const RandArgLower int = 3
 
 /**
@@ -406,9 +431,11 @@ func voteBackground(rf *Raft) {
 		}
 		rf.currentTerm += 1
 		rf.voteFor = rf.me
+		currentTerm := rf.currentTerm
 		// 发起投票
-		DPrintf("raft/raft/voteBackground: server [%d] start vote term[%d]", rf.me, rf.currentTerm)
+		DPrintf("raft/raft/voteBackground: server [%d] start vote term[%d]", rf.me, currentTerm)
 		var voteNum int32 = 1
+		var handleVote = false
 		waitGroup := sync.WaitGroup{}
 		waitGroup.Add(len(rf.peers) - 1)
 		for i := range rf.peers {
@@ -417,7 +444,7 @@ func voteBackground(rf *Raft) {
 			}
 			go func(i int) {
 				args := RequestVoteArgs{
-					Term:        rf.currentTerm,
+					Term:        currentTerm,
 					CandidateId: rf.me,
 					//todo: 这里在2B需要加参数
 				}
@@ -425,21 +452,36 @@ func voteBackground(rf *Raft) {
 				ok := rf.sendRequestVote(i, &args, &reply)
 				if ok && reply.VoteGranted {
 					atomic.AddInt32(&voteNum, 1)
-					DPrintf("raft/raft/voteBackground: server[%d] got vote from [%d] term[%d]", rf.me, i, rf.currentTerm)
+					rf.mu.Lock()
+					if voteNum > int32(len(rf.peers)/2) && !handleVote {
+						handleVote = true
+						// 选举成功，那就可以开始发heartbeat了
+						DPrintf("raft/raft/voteBackground: server[%d] vote success term[%d] with vote[%d/%d]", rf.me, currentTerm, voteNum, len(rf.peers))
+
+						rf.isLeader = true
+						rf.currentTerm = currentTerm
+						rf.matchIndex = make([]int, len(rf.peers))
+						for i := range rf.matchIndex {
+							rf.matchIndex[i] = 0
+						}
+						DPrintf("raft/raft/voteBackground: init matchIndex[%v]", rf.matchIndex)
+						rf.nextIndex = make([]int, len(rf.peers))
+						for i := range rf.nextIndex {
+							rf.nextIndex[i] = len(rf.log)
+						}
+						DPrintf("raft/raft/voteBackground: init nextIndex[%v]", rf.nextIndex)
+					}
+					rf.mu.Unlock()
+					DPrintf("raft/raft/voteBackground: server[%d] got vote from [%d] term[%d]", rf.me, i, currentTerm)
 				}
 				waitGroup.Done()
 			}(i)
 		}
 		waitGroup.Wait()
-		if voteNum > int32(len(rf.peers)/2) {
-			// 选举成功，那就可以开始发heartbeat了
-			DPrintf("raft/raft/voteBackground: server[%d] vote success term[%d] with vote[%d/%d]", rf.me, rf.currentTerm, voteNum, len(rf.peers))
-			rf.isLeader = true
-		} else {
+		if !handleVote {
 			// 选举失败，就设置一个随机的时钟，过一会儿再重新选举
-			DPrintf("raft/raft/voteBackground: server[%d] vote fail term[%d] with vote[%d/%d]", rf.me, rf.currentTerm, voteNum, len(rf.peers))
+			DPrintf("raft/raft/voteBackground: server[%d] vote fail term[%d] with vote[%d/%d]", rf.me, currentTerm, voteNum, len(rf.peers))
 			rf.timeout.Reset(randVoteTime(HeartBeatTime))
-
 		}
 	}
 }
@@ -455,26 +497,31 @@ func appendEntriesBackground(rf *Raft) {
 		}
 		logLen := len(rf.log)
 		var okNum int32 = 1
+		var applied bool = false
 		for i := range rf.peers {
 			if i == rf.me {
 				continue
 			}
 			go func(i int) {
 				nextIndex := rf.nextIndex[i]
+				//DPrintf("raft/raft/appendEntriesBackground: nextIndex := rf.nextIndex[%d] [%v]", i, rf.nextIndex[i])
 				entries := make([]Log, 0)
-				if nextIndex < logLen {
+				if nextIndex != -1 && nextIndex < logLen {
 					entries = rf.log[nextIndex:logLen]
+				}
+				prevLogTerm := -1
+				if nextIndex > 0 {
+					prevLogTerm = rf.log[nextIndex-1].Term
 				}
 				args := AppendEntriesArgs{
 					Term:         rf.currentTerm,
 					LeaderId:     rf.me,
 					LeaderCommit: rf.commitIndex,
 					PrevLogIndex: nextIndex - 1,
-					PrevLogTerm:  rf.log[nextIndex-1].Term,
+					PrevLogTerm:  prevLogTerm,
 					Entries:      entries,
 				}
 				reply := AppendEntriesReply{}
-				DPrintf("raft/raft/heartbeatBackground: server[%d] heartbeat term[%d] to[%d]", rf.me, rf.currentTerm, i)
 				ok := rf.sendAppendEntries(i, &args, &reply)
 				if ok && reply.Term > rf.currentTerm && rf.isLeader == true {
 					// 先只把appendEntries停掉就行
@@ -483,18 +530,34 @@ func appendEntriesBackground(rf *Raft) {
 				if reply.Success {
 					// todo: 这里是否需要考虑并发问题 比如上一个请求还没返回回来，下一个请求已经发出并且回来了
 					atomic.AddInt32(&okNum, 1)
-					rf.matchIndex[i] = logLen - 1
-					rf.nextIndex[i] = logLen
+					if rf.matchIndex[i] < logLen-1 {
+						rf.matchIndex[i] = logLen - 1
+						rf.nextIndex[i] = logLen
+					}
 				} else {
 					// 如果失败了，把nextIndex向后减少一位，等下次loop再发
-					rf.nextIndex[i] -= 1
+					if rf.nextIndex[i] > 0 {
+						rf.nextIndex[i] -= 1
+					}
+
 				}
-				// 这玩意可以幂等，所以不用加锁应该
-				if okNum > int32(len(rf.peers)/2) {
+				// 加锁发消息
+				rf.mu.Lock()
+				if okNum > int32(len(rf.peers)/2) && !applied {
+					oldCommitIndex := rf.commitIndex
 					rf.commitIndex = logLen - 1
+					applied = true
+					for i := oldCommitIndex + 1; i < rf.commitIndex+1; i++ {
+						applyMsg := ApplyMsg{
+							Index:   i + 1,
+							Command: rf.log[i].Command,
+						}
+						DPrintf("raft/raft/appendEntriesBackground: server[%d] send to applyCh [%v]", rf.me, applyMsg)
+						rf.applyCh <- applyMsg
+					}
 				}
+				rf.mu.Unlock()
 			}(i)
 		}
-
 	}
 }

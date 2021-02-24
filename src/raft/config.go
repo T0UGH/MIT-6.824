@@ -323,6 +323,9 @@ func (cfg *config) checkNoLeader() {
 	}
 }
 
+// 有多少servers认为一个logEntry是已提交的
+// 入参是这个log的索引
+// 返回值是有多少人认为，以及这个log本身
 // how many servers think a log entry is committed?
 func (cfg *config) nCommitted(index int) (int, interface{}) {
 	count := 0
@@ -379,6 +382,11 @@ func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 	return cmd
 }
 
+// 进行一个完整的协议。
+// 它可能最初选择了错误的领导者，并且在放弃后必须重新提交。
+// 大约10秒后完全放弃。
+// 间接检查服务器是否同意相同的值，因为nCommitted（）会检查此值，就像从applyCh读取的线程一样。
+// 返回索引。
 // do a complete agreement.
 // it might choose the wrong leader initially,
 // and have to re-submit after giving up.
@@ -392,6 +400,7 @@ func (cfg *config) one(cmd int, expectedServers int) int {
 	starts := 0
 	for time.Since(t0).Seconds() < 10 {
 		// try all the servers, maybe one is the leader.
+		// 向所有server提交这个命令，可能有一个是leader，会干这件事
 		index := -1
 		for si := 0; si < cfg.n; si++ {
 			starts = (starts + 1) % cfg.n
@@ -409,13 +418,14 @@ func (cfg *config) one(cmd int, expectedServers int) int {
 				}
 			}
 		}
-
+		DPrintf("raft/config/one: index:[%d]", index)
 		if index != -1 {
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				DPrintf("raft/config/one: index[%d] nd[%d] logs[%v]", index, nd, cfg.logs)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {
