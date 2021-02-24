@@ -73,7 +73,16 @@ type Raft struct {
 
 type Log struct {
 	Command interface{}
-	term    int
+	Term    int
+}
+
+func (rf *Raft) initState() {
+	rf.isLeader = false
+	rf.currentTerm = -1
+	rf.commitIndex = -1
+	rf.lastApplied = -1
+	rf.voteFor = -1
+	rf.log = make([]Log, 0)
 }
 
 // 返回当前的term号，以及这个peer是否leader
@@ -144,13 +153,17 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term int
-	// todo: 实现2B2C
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Log //todo: 这里是Log类型还是Command类型,不好说啊
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
 	Term    int
-	success bool
+	Success bool
 	// todo: 实现2B2C
 }
 
@@ -160,22 +173,29 @@ type AppendEntriesReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
+	// 如果参数中的任期小于当前任期，一看就是个老candidate，直接返回false
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
 
-	// 如果任期等于当前任期，那么已经投过票了，返回投票结构就行了
+	// 如果参数中的任期等于当前任期，那么已经投过票了，返回投票结构就行了
 	if args.Term == rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = rf.voteFor == args.CandidateId
 		return
 	}
 
-	// todo 在2B中要加比较谁新的逻辑, 首先要
-	// 如果任期大于当前任期，那肯定还没投，就给它投
+	// todo 检查一下这个判断语句对不对
+	// 如果参数中的任期大于当前任期，但候选者的日志比较旧，也不能投票给它
+	if args.LastLogTerm < rf.log[len(rf.log)-1].Term || args.LastLogIndex < len(rf.log)-1 {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
 
+	// 如果任期大于当前任期，且候选者的日志还比较新，就给它投
 	rf.currentTerm = args.Term
 	rf.voteFor = args.CandidateId
 	reply.Term = rf.currentTerm
@@ -188,25 +208,50 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // Append Entries Handler
 // Append Entries RPC的处理函数
 //
+// todo: 处理并发
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here (2A, 2B).
+	// 如果term比自己还老，说明这个是个老领导，老领导的AppendEntries就不用管了，直接返回false
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
-		reply.success = false
+		reply.Success = false
 		return
 	}
+
+	// 2 prevLog没有怎么处理
+	noPrevLog := args.PrevLogIndex > len(rf.log) || args.PrevLogTerm != -1 && args.PrevLogTerm != rf.log[args.PrevLogIndex].Term
+	if noPrevLog {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	// 3and4 截取并且拼接
+	rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
+
+	// 如果我是领导，并且还收到了一个至少termNumber跟我一样新的AppendEntries，就说明我是老领导，则设置我不是领导了
 	if rf.isLeader {
 		rf.isLeader = false
 	}
+	// 如果term比我还新，就说明我的term是旧的，就更新一下
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 	}
-	// 收到合格的heartbeat就重置时钟
+
+	if args.LeaderCommit > rf.commitIndex {
+		if args.LeaderCommit > len(rf.log) {
+			rf.commitIndex = len(rf.log)
+		} else {
+			rf.commitIndex = args.LeaderCommit
+		}
+	}
+
+	// 重置时钟
 	rf.timeout.Stop()
 	rf.timeout.Reset(randVoteTime(HeartBeatTime))
 
 	reply.Term = rf.currentTerm
-	reply.success = true
+	reply.Success = true
 	return
 }
 
@@ -274,12 +319,19 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
+	//todo:这个相当于上层在调用AppendEntries，而且还要马上返回
+	if !rf.isLeader {
+		return -1, -1, false
+	}
+	// 放到日志里面
+	// todo: 加锁还是不加锁
+	rf.mu.Lock()
+	index := len(rf.log)
+	rf.log = append(rf.log, Log{Command: command, Term: rf.currentTerm})
+	term := rf.currentTerm
 	isLeader := true
-
 	// Your code here (2B).
-
+	rf.mu.Unlock()
 	return index, term, isLeader
 }
 
@@ -309,13 +361,14 @@ func (rf *Raft) Kill() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	//todo: 如果commit完了要通过applyCh发送给上层app
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-
+	rf.initState()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
@@ -324,8 +377,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 启动投票后台进程
 	go voteBackground(rf)
 
-	// 启动heartbeat投票进程
-	go heartbeatBackground(rf)
+	// 启动appendEntries后台进程
+	go appendEntriesBackground(rf)
 
 	return rf
 }
@@ -394,29 +447,54 @@ func voteBackground(rf *Raft) {
 /**
 * 开启一个后台进程，如果rf.isLeader就定期发heartbeat，不然就不发
  */
-func heartbeatBackground(rf *Raft) {
+func appendEntriesBackground(rf *Raft) {
 	for {
-		if rf.isLeader {
-
-			for i := range rf.peers {
-				if i == rf.me {
-					continue
-				}
-				go func(i int) {
-					args := AppendEntriesArgs{
-						Term: rf.currentTerm,
-						//todo: 这里在2B需要加参数
-					}
-					reply := AppendEntriesReply{}
-					DPrintf("raft/raft/heartbeatBackground: server[%d] heartbeat term[%d] to[%d]", rf.me, rf.currentTerm, i)
-					ok := rf.sendAppendEntries(i, &args, &reply)
-					if ok && reply.Term > rf.currentTerm && rf.isLeader == true {
-						// 先只把heartbeat停掉就行
-						rf.isLeader = false
-					}
-				}(i)
-			}
-		}
 		time.Sleep(HeartBeatTime)
+		if !rf.isLeader {
+			continue
+		}
+		logLen := len(rf.log)
+		var okNum int32 = 1
+		for i := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+			go func(i int) {
+				nextIndex := rf.nextIndex[i]
+				entries := make([]Log, 0)
+				if nextIndex < logLen {
+					entries = rf.log[nextIndex:logLen]
+				}
+				args := AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					LeaderCommit: rf.commitIndex,
+					PrevLogIndex: nextIndex - 1,
+					PrevLogTerm:  rf.log[nextIndex-1].Term,
+					Entries:      entries,
+				}
+				reply := AppendEntriesReply{}
+				DPrintf("raft/raft/heartbeatBackground: server[%d] heartbeat term[%d] to[%d]", rf.me, rf.currentTerm, i)
+				ok := rf.sendAppendEntries(i, &args, &reply)
+				if ok && reply.Term > rf.currentTerm && rf.isLeader == true {
+					// 先只把appendEntries停掉就行
+					rf.isLeader = false
+				}
+				if reply.Success {
+					// todo: 这里是否需要考虑并发问题 比如上一个请求还没返回回来，下一个请求已经发出并且回来了
+					atomic.AddInt32(&okNum, 1)
+					rf.matchIndex[i] = logLen - 1
+					rf.nextIndex[i] = logLen
+				} else {
+					// 如果失败了，把nextIndex向后减少一位，等下次loop再发
+					rf.nextIndex[i] -= 1
+				}
+				// 这玩意可以幂等，所以不用加锁应该
+				if okNum > int32(len(rf.peers)/2) {
+					rf.commitIndex = logLen - 1
+				}
+			}(i)
+		}
+
 	}
 }
