@@ -189,8 +189,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// todo 检查一下这个判断语句对不对
-	// 如果参数中的任期大于当前任期，但候选者的日志比较旧，也不能投票给它
-	if args.LastLogIndex < len(rf.log)-1 || len(rf.log) != 0 && args.LastLogTerm < rf.log[len(rf.log)-1].Term {
+	// 如果最后一条日志的任期比args.LastLogTerm新，或者 一样term一样新，但是len(rf.log) - 1 比 args.lastLogIndex 要大，就不投票给它
+	DPrintf("raft/raft/RequestVote: compare new server [%d] compare[%+v] log[%+v]", rf.me, args, rf.log)
+	if len(rf.log) > 0 && ((args.LastLogTerm < rf.log[len(rf.log)-1].Term) ||
+		(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex < len(rf.log)-1)) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
@@ -433,7 +435,7 @@ func voteBackground(rf *Raft) {
 		rf.voteFor = rf.me
 		currentTerm := rf.currentTerm
 		// 发起投票
-		DPrintf("raft/raft/voteBackground: server [%d] start vote term[%d]", rf.me, currentTerm)
+		DPrintf("raft/raft/voteBackground: server[%d] start vote term[%d]", rf.me, currentTerm)
 		var voteNum int32 = 1
 		var handleVote = false
 		waitGroup := sync.WaitGroup{}
@@ -442,11 +444,17 @@ func voteBackground(rf *Raft) {
 			if i == rf.me {
 				continue
 			}
+			lastLog := Log{Command: nil, Term: -1}
+			logLen := len(rf.log)
+			if logLen > 0 {
+				lastLog = rf.log[logLen-1]
+			}
 			go func(i int) {
 				args := RequestVoteArgs{
-					Term:        currentTerm,
-					CandidateId: rf.me,
-					//todo: 这里在2B需要加参数
+					Term:         currentTerm,
+					CandidateId:  rf.me,
+					LastLogIndex: logLen - 1,
+					LastLogTerm:  lastLog.Term,
 				}
 				reply := RequestVoteReply{}
 				ok := rf.sendRequestVote(i, &args, &reply)
@@ -545,7 +553,11 @@ func appendEntriesBackground(rf *Raft) {
 				rf.mu.Lock()
 				if okNum > int32(len(rf.peers)/2) && !applied {
 					oldCommitIndex := rf.commitIndex
-					rf.commitIndex = logLen - 1
+					if len(rf.log) < logLen {
+						rf.commitIndex = len(rf.log) - 1
+					} else {
+						rf.commitIndex = logLen - 1
+					}
 					applied = true
 					for i := oldCommitIndex + 1; i < rf.commitIndex+1; i++ {
 						applyMsg := ApplyMsg{
