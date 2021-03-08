@@ -109,6 +109,9 @@ func (cfg *config) crash1(i int) {
 	}
 }
 
+// 开启或重启一个Raft
+// 如果它已经存在了，先杀掉它
+// 分配新的port file names和一个新的状态persister来隔离之前的服务实例。因为我们无法真正kill掉它
 //
 // start or re-start a Raft.
 // if one already exists, "kill" it first.
@@ -326,7 +329,7 @@ func (cfg *config) checkNoLeader() {
 // 有多少servers认为一个logEntry是已提交的
 // 入参是这个log的索引
 // 返回值是有多少人认为，以及这个log本身
-// how many servers think a log entry is committed?
+// how many servers think a Logs entry is committed?
 func (cfg *config) nCommitted(index int) (int, interface{}) {
 	count := 0
 	cmd := -1
